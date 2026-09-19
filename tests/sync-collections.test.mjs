@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join, dirname, basename, resolve } from 'node:path';
 import {
   PLAYLISTS, extractInitialData, extractClientContext, parsePlaylistData,
-  fetchPlaylist, validateManifest, synchronize, writeManifestAtomic, readPrevious,
+  fetchPlaylist, fetchPlaylistWithRetry, validateManifest, synchronize, writeManifestAtomic, readPrevious, main,
 } from '../scripts/sync-collections.mjs';
 
 const id = (n) => `v${String(n).padStart(10, '0')}`;
@@ -30,6 +30,7 @@ const clientConfig = {
 };
 const html = (value) => `<script>ytcfg.set(${JSON.stringify(clientConfig)});var ytInitialData = ${JSON.stringify(value)};</script>`;
 const reply = (body, status = 200) => new Response(typeof body === 'string' ? body : JSON.stringify(body), { status });
+const retryOptions = { sleepImpl: async () => {}, log: () => {} };
 const categoryFor = (url) => Object.keys(PLAYLISTS).find((key) => url.includes(PLAYLISTS[key].playlistId));
 const refreshReply = (url, song) => {
   const key = categoryFor(url);
@@ -151,22 +152,194 @@ test('normal refresh preserves the previous failed category; strict refresh reje
   const previous = manifest();
   const untouched = structuredClone(previous);
   const fetchImpl = async (url) => url.includes(PLAYLISTS.song.playlistId) ? reply(html(data([legacy(8)]))) : reply('Unavailable', 503);
-  const normal = await synchronize({ previous, fetchImpl, now: '2026-09-10T00:00:00Z' });
+  const normal = await synchronize({ previous, fetchImpl, retryOptions, now: '2026-09-10T00:00:00Z' });
   assert.deepEqual(normal.refreshed, ['song']);
   assert.deepEqual(normal.manifest.collections.asmr, previous.collections.asmr);
   assert.deepEqual(normal.manifest.collections.aegyo, previous.collections.aegyo);
   assert.equal(normal.manifest.collections.song.tracks[0].id, id(8));
   assert.equal(normal.failures[0].key, 'asmr');
-  await assert.rejects(synchronize({ previous, fetchImpl, strict: true }), /output was not changed/);
-  await assert.rejects(synchronize({ fetchImpl }), /output was not changed/);
+  await assert.rejects(synchronize({ previous, fetchImpl, retryOptions, strict: true }), /output was not changed/);
+  await assert.rejects(synchronize({ fetchImpl, retryOptions }), /output was not changed/);
   assert.deepEqual(previous, untouched);
 });
 
 test('complete fetch failure retains the last-good manifest and timestamp', async () => {
   const previous = manifest();
-  const result = await synchronize({ previous, fetchImpl: async () => { throw new Error('network unavailable'); } });
+  const result = await synchronize({ previous, retryOptions, fetchImpl: async () => { throw new Error('network unavailable'); } });
   assert.equal(result.unchanged, true);
   assert.deepEqual(result.manifest, previous);
+});
+
+test('playlist refresh retries malformed or missing initial data, network failures, and transient HTTP errors', async () => {
+  const transient = [
+    () => reply('<script>var ytInitialData = {"broken":</script>'),
+    () => reply('<html>Temporary playlist response</html>'),
+    () => { throw new TypeError('fetch failed'); },
+    ...[408, 429, 500, 503].map((status) => () => reply('Try again later', status)),
+  ];
+  for (const fail of transient) {
+    let calls = 0;
+    const delays = [];
+    const result = await fetchPlaylistWithRetry('song', {
+      ...retryOptions,
+      sleepImpl: async (milliseconds) => { delays.push(milliseconds); },
+      fetchImpl: async () => ++calls === 1 ? fail() : reply(html(data([legacy(7), legacy(8)]))),
+    });
+    assert.equal(calls, 2);
+    assert.equal(delays.length, 1);
+    assert.ok(Number.isFinite(delays[0]) && delays[0] > 0);
+    assert.deepEqual(result.tracks.map((track) => track.id), [id(7), id(8)]);
+  }
+});
+
+test('persistent malformed initial data exhausts three attempts without unbounded retries', async () => {
+  let calls = 0;
+  const delays = [];
+  await assert.rejects(fetchPlaylistWithRetry('song', {
+    ...retryOptions,
+    sleepImpl: async (milliseconds) => { delays.push(milliseconds); },
+    fetchImpl: async () => {
+      calls += 1;
+      return reply('<script>var ytInitialData = {"broken":</script>');
+    },
+  }), /Malformed ytInitialData/);
+  assert.equal(calls, 3);
+  assert.equal(delays.length, 2);
+});
+
+test('permanent HTTP errors, unavailable playlists, and wrong playlist identities are not retried', async () => {
+  const privatePlaylist = data([legacy(1)]);
+  privatePlaylist.alerts = [{ alertRenderer: { type: 'ERROR', text: { simpleText: 'Private playlist' } } }];
+  const permanent = [
+    { body: () => reply('Not found', 404), error: /HTTP 404/ },
+    { body: () => reply(html(privatePlaylist)), error: /private|rejected/ },
+    { body: () => reply(html(data([legacy(1, 'asmr')], 'asmr'))), error: /wrong playlist/ },
+  ];
+  for (const { body, error } of permanent) {
+    let calls = 0;
+    let sleeps = 0;
+    await assert.rejects(fetchPlaylistWithRetry('song', {
+      ...retryOptions,
+      sleepImpl: async () => { sleeps += 1; },
+      fetchImpl: async () => { calls += 1; return body(); },
+    }), error);
+    assert.equal(calls, 1);
+    assert.equal(sleeps, 0);
+  }
+});
+
+test('a malformed continuation restarts the full playlist without retaining stale partial tracks', async () => {
+  const requests = [];
+  const result = await fetchPlaylistWithRetry('song', {
+    ...retryOptions,
+    fetchImpl: async (url, options) => {
+      requests.push({ url, options });
+      if (requests.length === 1) return reply(html(data([legacy(1), token('OLD')])));
+      if (requests.length === 2) return reply('{"broken":');
+      if (requests.length === 3) return reply(html(data([legacy(3), legacy(4), token('NEW')])));
+      return reply({ onResponseReceivedActions: [{ appendContinuationItemsAction: { continuationItems: [legacy(4), legacy(5)] } }] });
+    },
+  });
+  assert.equal(requests.length, 4);
+  assert.equal(requests[0].url, requests[2].url);
+  assert.equal(JSON.parse(requests[1].options.body).continuation, 'OLD');
+  assert.equal(JSON.parse(requests[3].options.body).continuation, 'NEW');
+  assert.deepEqual(result.tracks.map((track) => track.id), [id(3), id(4), id(5)]);
+});
+
+test('scheduled partial failures skip publication and retain the complete previous catalog and timestamp', async () => {
+  const previous = manifest();
+  const untouched = structuredClone(previous);
+  const calls = { song: 0, asmr: 0, aegyo: 0 };
+  const result = await synchronize({
+    previous, scheduled: true, retryOptions, now: '2026-09-19T00:00:00Z',
+    fetchImpl: async (url) => {
+      const key = categoryFor(url);
+      calls[key] += 1;
+      return key === 'aegyo' ? reply('<script>var ytInitialData = {"broken":</script>') : reply(html(data([legacy(9, key)], key)));
+    },
+  });
+  assert.equal(result.publish, false);
+  assert.equal(result.unchanged, true);
+  assert.deepEqual(result.refreshed, []);
+  assert.deepEqual(result.failures.map(({ key }) => key), ['aegyo']);
+  assert.deepEqual(result.manifest, untouched);
+  assert.deepEqual(previous, untouched);
+  assert.deepEqual(calls, { song: 1, asmr: 1, aegyo: 3 });
+});
+
+test('scheduled failures also skip publication when no valid previous catalog exists', async () => {
+  const result = await synchronize({
+    scheduled: true, retryOptions,
+    fetchImpl: async (url) => categoryFor(url) === 'song' ? reply('Unavailable', 503) : reply(html(data([legacy(9, categoryFor(url))], categoryFor(url)))),
+  });
+  assert.equal(result.publish, false);
+  assert.equal(result.manifest, null);
+  assert.equal(result.unchanged, true);
+  assert.deepEqual(result.refreshed, []);
+  assert.deepEqual(result.failures.map(({ key }) => key), ['song']);
+});
+
+test('successful scheduled refreshes publish every collection together', async () => {
+  const result = await synchronize({
+    scheduled: true, retryOptions, now: '2026-09-19T00:00:00Z',
+    fetchImpl: async (url) => {
+      const key = categoryFor(url);
+      return reply(html(data([legacy(9, key)], key)));
+    },
+  });
+  assert.equal(result.publish, true);
+  assert.equal(result.unchanged, false);
+  assert.deepEqual(result.refreshed, Object.keys(PLAYLISTS));
+  assert.deepEqual(result.failures, []);
+  assert.equal(result.manifest.updatedAt, '2026-09-19T00:00:00.000Z');
+  for (const key of Object.keys(PLAYLISTS)) assert.deepEqual(result.manifest.collections[key].tracks.map((track) => track.id), [id(9)]);
+});
+
+test('explicit strict mode still rejects failed scheduled refreshes', async () => {
+  await assert.rejects(synchronize({
+    previous: manifest(), scheduled: true, strict: true, retryOptions,
+    fetchImpl: async () => reply('Unavailable', 503),
+  }), /output was not changed/);
+});
+
+test('scheduled CLI publishes its decision and never overwrites or creates a catalog after refresh failure', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'karume-catalog-test-'));
+  const environmentKeys = ['SYNC_STRICT', 'SYNC_SCHEDULED', 'GITHUB_ACTIONS', 'GITHUB_OUTPUT', 'GITHUB_STEP_SUMMARY'];
+  const environment = Object.fromEntries(environmentKeys.map((key) => [key, process.env[key]]));
+  const warnings = [];
+  t.mock.method(console, 'error', (message) => { warnings.push(message); });
+  t.mock.method(console, 'log', () => {});
+  t.mock.method(globalThis, 'fetch', async (url) => {
+    const key = categoryFor(url);
+    return !key || key === 'song' ? reply('Not found', 404) : reply(html(data([legacy(9, key)], key)));
+  });
+  try {
+    delete process.env.SYNC_STRICT;
+    delete process.env.SYNC_SCHEDULED;
+    process.env.GITHUB_ACTIONS = 'true';
+    for (const hasPrevious of [true, false]) {
+      const output = join(directory, `${hasPrevious ? 'existing' : 'missing'}.json`);
+      process.env.GITHUB_OUTPUT = join(directory, `${hasPrevious}-github-output`);
+      process.env.GITHUB_STEP_SUMMARY = join(directory, `${hasPrevious}-summary`);
+      const original = `${JSON.stringify(manifest())}\n`;
+      if (hasPrevious) await writeFile(output, original);
+      await main(['--scheduled', '--output', output]);
+      assert.equal(await readFile(process.env.GITHUB_OUTPUT, 'utf8'), 'publish=false\n');
+      assert.match(await readFile(process.env.GITHUB_STEP_SUMMARY, 'utf8'), /kept unchanged/);
+      if (hasPrevious) assert.equal(await readFile(output, 'utf8'), original);
+      else await assert.rejects(readFile(output, 'utf8'), { code: 'ENOENT' });
+    }
+    assert.equal(warnings.filter((message) => message.startsWith('::warning::')).length, 2);
+  } finally {
+    for (const [key, value] of Object.entries(environment)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    assert.equal(dirname(resolve(directory)), resolve(tmpdir()));
+    assert.ok(basename(directory).startsWith('karume-catalog-test-'));
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test('unknown, unrelated, malformed video data and invalid manifests cannot replace catalogs', async () => {
@@ -240,7 +413,7 @@ test('a new category preserves published Song/ASMR and fills only its missing se
     assert.deepEqual(merged.collections.asmr, published.collections.asmr);
     assert.deepEqual(merged.collections.aegyo, seed.collections.aegyo);
     assert.equal(merged.updatedAt, published.updatedAt);
-    const fallback = await synchronize({ previous: merged, fetchImpl: async () => { throw new Error('offline'); } });
+    const fallback = await synchronize({ previous: merged, retryOptions, fetchImpl: async () => { throw new Error('offline'); } });
     assert.deepEqual(fallback.manifest, merged);
     const malformed = structuredClone(published);
     malformed.collections.song = null;

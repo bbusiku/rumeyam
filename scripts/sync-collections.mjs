@@ -1,8 +1,9 @@
 #!/usr/bin/env node
-import { readFile, writeFile, mkdir, rename, unlink } from 'node:fs/promises';
+import { readFile, writeFile, appendFile, mkdir, rename, unlink } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
+import { setTimeout as delay } from 'node:timers/promises';
 
 export const PLAYLISTS = Object.freeze({
   song: { playlistId: 'PLJmCvCN8XgA8', title: '루메 노래' },
@@ -15,6 +16,8 @@ const MAX_PAGES = 100;
 const MAX_TRACKS = 5000;
 const REQUEST_TIMEOUT = 25000;
 const MAX_RESPONSE_SIZE = 12 * 1024 * 1024;
+
+class RetryablePlaylistError extends Error {}
 
 const object = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
 const text = (value) => {
@@ -95,7 +98,7 @@ export function extractInitialData(html) {
   if (/confirm (?:that )?you.?re not a bot|unusual traffic|unusual requests|로봇이 아님|비정상적인 트래픽/i.test(html)) {
     throw new Error('YouTube returned a bot or traffic challenge.');
   }
-  throw new Error(errors.length ? 'Malformed ytInitialData in playlist page.' : 'Playlist page has no readable ytInitialData.');
+  throw new RetryablePlaylistError(errors.length ? 'Malformed ytInitialData in playlist page.' : 'Playlist page has no readable ytInitialData.');
 }
 
 export function extractClientContext(html) {
@@ -225,10 +228,17 @@ export function parsePlaylistData(data, playlistId, { continuation = false } = {
 }
 
 async function responseText(fetchImpl, url, options = {}) {
-  const response = await fetchImpl(url, { ...options, signal: AbortSignal.timeout(REQUEST_TIMEOUT) });
-  if (!response.ok) throw new Error(`Request failed with HTTP ${response.status}.`);
+  let response;
+  try { response = await fetchImpl(url, { ...options, signal: AbortSignal.timeout(REQUEST_TIMEOUT) }); }
+  catch (error) { throw new RetryablePlaylistError(`Request could not complete: ${error.message}`, { cause: error }); }
+  if (!response.ok) {
+    const ErrorType = [408, 429].includes(response.status) || response.status >= 500 ? RetryablePlaylistError : Error;
+    throw new ErrorType(`Request failed with HTTP ${response.status}.`);
+  }
   if (Number(response.headers?.get('content-length')) > MAX_RESPONSE_SIZE) throw new Error('Response is too large.');
-  const body = await response.text();
+  let body;
+  try { body = await response.text(); }
+  catch (error) { throw new RetryablePlaylistError(`Response could not complete: ${error.message}`, { cause: error }); }
   if (body.length > MAX_RESPONSE_SIZE) throw new Error('Response is too large.');
   return body;
 }
@@ -263,7 +273,7 @@ export async function fetchPlaylist(key, { fetchImpl = fetch, maxPages = MAX_PAG
     });
     let data;
     try { data = JSON.parse(body.replace(/^\)\]\}'\s*\n?/, '')); }
-    catch { throw new Error('YouTube continuation returned invalid JSON.'); }
+    catch { throw new RetryablePlaylistError('YouTube continuation returned invalid JSON.'); }
     const page = parsePlaylistData(data, config.playlistId, { continuation: true });
     add(page.tracks);
     token = page.continuation;
@@ -271,6 +281,19 @@ export async function fetchPlaylist(key, { fetchImpl = fetch, maxPages = MAX_PAG
   }
   if (!tracks.size && !first.emptyList) throw new Error('Playlist has no recognized public video list; keeping the previous catalog.');
   return { playlistId: config.playlistId, title: first.title, tracks: [...tracks.values()] };
+}
+
+export async function fetchPlaylistWithRetry(key, { attempts = 3, sleepImpl = delay, log = console.error, ...options } = {}) {
+  if (!Number.isInteger(attempts) || attempts < 1 || attempts > 3) throw new Error('Invalid retry limit.');
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try { return await fetchPlaylist(key, options); }
+    catch (error) {
+      if (!(error instanceof RetryablePlaylistError) || attempt === attempts) throw error;
+      log(`Retrying ${key} (${attempt + 1}/${attempts}): ${error.message}`);
+      // Restart the entire playlist so a failed continuation never publishes a partial list.
+      await sleepImpl(1000 * 2 ** (attempt - 1));
+    }
+  }
 }
 
 export function validateManifest(value, { allowMissing = false } = {}) {
@@ -297,10 +320,10 @@ export function validateManifest(value, { allowMissing = false } = {}) {
   return { version: 1, updatedAt: new Date(value.updatedAt).toISOString(), collections };
 }
 
-export async function synchronize({ previous = null, strict = false, fetchImpl = fetch, now = new Date() } = {}) {
+export async function synchronize({ previous = null, strict = false, scheduled = false, fetchImpl = fetch, now = new Date(), retryOptions = {} } = {}) {
   const lastGood = previous ? validateManifest(previous) : null;
   const keys = Object.keys(PLAYLISTS);
-  const results = await Promise.allSettled(keys.map((key) => fetchPlaylist(key, { fetchImpl })));
+  const results = await Promise.allSettled(keys.map((key) => fetchPlaylistWithRetry(key, { ...retryOptions, fetchImpl })));
   const collections = {};
   const refreshed = [];
   const failures = [];
@@ -313,11 +336,19 @@ export async function synchronize({ previous = null, strict = false, fetchImpl =
       if (lastGood) collections[key] = lastGood.collections[key];
     }
   }
-  if (failures.length && (strict || !lastGood)) {
+  if (failures.length && strict) {
+    throw new Error(`Catalog refresh failed; output was not changed. ${failures.map(({ key, message }) => `${key}: ${message}`).join(' ')}`);
+  }
+  // A scheduled refresh must never redeploy older checkout seeds or partial data.
+  // Leave the current Pages deployment intact and try again at the next schedule.
+  if (failures.length && scheduled) {
+    return { manifest: lastGood, refreshed: [], failures, unchanged: true, publish: false };
+  }
+  if (failures.length && !lastGood) {
     throw new Error(`Catalog refresh failed; output was not changed. ${failures.map(({ key, message }) => `${key}: ${message}`).join(' ')}`);
   }
   const manifest = refreshed.length ? validateManifest({ version: 1, updatedAt: new Date(now).toISOString(), collections }) : lastGood;
-  return { manifest, refreshed, failures, unchanged: refreshed.length === 0 };
+  return { manifest, refreshed, failures, unchanged: refreshed.length === 0, publish: true };
 }
 
 export async function writeManifestAtomic(output, manifest) {
@@ -351,16 +382,30 @@ export async function readPrevious(output, { fetchImpl = fetch, log = console.er
 export async function main(args = process.argv.slice(2)) {
   let output = resolve('public/collections.json');
   let strict = process.env.SYNC_STRICT === 'true';
+  let scheduled = process.env.SYNC_SCHEDULED === 'true';
   for (let i = 0; i < args.length; i += 1) {
     if (args[i] === '--strict') strict = true;
+    else if (args[i] === '--scheduled') scheduled = true;
     else if (args[i] === '--output' && args[i + 1] && !args[i + 1].startsWith('--')) output = resolve(args[++i]);
     else if (args[i] === '--help') {
-      console.log('Usage: node scripts/sync-collections.mjs [--strict] [--output public/collections.json]\nStrict mode (--strict or SYNC_STRICT=true) requires all playlists to refresh before writing. Normal mode preserves last-good categories on partial failures.');
+      console.log('Usage: node scripts/sync-collections.mjs [--strict] [--scheduled] [--output public/collections.json]\nStrict mode (--strict or SYNC_STRICT=true) requires all playlists to refresh before writing. Scheduled mode (--scheduled or SYNC_SCHEDULED=true) skips publication on refresh failures. Normal mode preserves last-good categories on partial failures.');
       return;
     } else throw new Error(`Unknown or incomplete option: ${args[i]}`);
   }
   const previous = await readPrevious(output);
-  const result = await synchronize({ previous, strict });
+  const result = await synchronize({ previous, strict, scheduled });
+  if (process.env.GITHUB_OUTPUT) await appendFile(process.env.GITHUB_OUTPUT, `publish=${result.publish}\n`);
+  if (!result.publish) {
+    for (const failure of result.failures) {
+      const message = `Scheduled refresh deferred; the live site is unchanged. ${failure.key}: ${failure.message}`;
+      const escaped = message.replace(/%/g, '%25').replace(/\r/g, '%0D').replace(/\n/g, '%0A');
+      console.error(process.env.GITHUB_ACTIONS === 'true' ? `::warning::${escaped}` : message);
+    }
+    if (process.env.GITHUB_STEP_SUMMARY) {
+      await appendFile(process.env.GITHUB_STEP_SUMMARY, 'Playlist refresh was deferred after an upstream error. The current site and its published catalog were kept unchanged. The next hourly run will try again; see the refresh warnings for details.\n');
+    }
+    return;
+  }
   for (const key of result.refreshed) console.log(`Fetched live ${key}: ${result.manifest.collections[key].tracks.length} videos from https://www.youtube.com/playlist?list=${PLAYLISTS[key].playlistId}`);
   for (const failure of result.failures) console.error(`Keeping last-good ${failure.key}: ${failure.message}`);
   await writeManifestAtomic(output, result.manifest);
