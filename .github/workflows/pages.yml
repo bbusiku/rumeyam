@@ -16,6 +16,8 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    outputs:
+      publish: ${{ steps.refresh.outputs.publish }}
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
@@ -28,24 +30,32 @@ jobs:
         id: pages
         uses: actions/configure-pages@v5
       - name: Refresh YouTube playlists
+        id: refresh
         env:
-          SYNC_STRICT: ${{ github.event_name == 'schedule' }}
+          SYNC_SCHEDULED: ${{ github.event_name == 'schedule' }}
         run: node scripts/sync-collections.mjs
       - run: pnpm install --frozen-lockfile --ignore-scripts
+        if: steps.refresh.outputs.publish == 'true'
       - run: pnpm test
+        if: steps.refresh.outputs.publish == 'true'
       - run: pnpm typecheck
+        if: steps.refresh.outputs.publish == 'true'
       - run: pnpm build
+        if: steps.refresh.outputs.publish == 'true'
         env:
           NEXT_PUBLIC_BASE_PATH: ${{ steps.pages.outputs.base_path }}
       - run: node scripts/check-build.mjs
+        if: steps.refresh.outputs.publish == 'true'
         env:
           NEXT_PUBLIC_BASE_PATH: ${{ steps.pages.outputs.base_path }}
       - uses: actions/upload-pages-artifact@v4
+        if: steps.refresh.outputs.publish == 'true'
         with:
           path: dist/client
   deploy:
     runs-on: ubuntu-latest
     needs: build
+    if: needs.build.outputs.publish == 'true'
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
